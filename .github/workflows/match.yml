@@ -40,7 +40,7 @@ jobs:
         shell: bash
         run: |
           VER="$(echo "$EGA_TAG" | sed 's/^console_v//; s/\./_/g')"
-          wget -q -O ega.zip "https://github.com/Nyanyan/Egaroucid/releases/download/${EGA_TAG}/Egaroucid_for_Console_${VER}_Windows_AVX2.zip"
+          curl -sL -o ega.zip "https://github.com/Nyanyan/Egaroucid/releases/download/${EGA_TAG}/Egaroucid_for_Console_${VER}_Windows_AVX2.zip"
           unzip -q ega.zip -d ega
 
       - name: Verify KOKUBYAKU files
