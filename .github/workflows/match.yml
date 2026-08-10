@@ -39,7 +39,6 @@ jobs:
       - name: Download Egaroucid (Windows release)
         shell: bash
         run: |
-          # GitHub APIを使って、指定されたタグの中からWindows用のZIPを自動検索してダウンロードします
           echo "Fetching release info for tag: ${EGA_TAG}"
           API_URL="https://api.github.com/repos/Nyanyan/Egaroucid/releases/tags/${EGA_TAG}"
           
@@ -59,17 +58,28 @@ jobs:
           echo "Downloading from: $DOWNLOAD_URL"
           curl -sL -o ega.zip "$DOWNLOAD_URL"
           
-          # 解凍し、exeが存在するディレクトリを ega/ にリネームして構造を統一する
+          # 解凍
           unzip -q ega.zip -d ega_temp
-          EGA_EXE=$(find ega_temp -name "Egaroucid_for_Console.exe" | head -n 1)
           
-          if [ -z "$EGA_EXE" ]; then
-            echo "エラー: ZIP内に Egaroucid_for_Console.exe が見つかりませんでした。"
+          # .exeファイルの名前がバージョン等で異なる場合があるため、柔軟に検索する
+          EGA_EXE_PATH=$(find ega_temp -iname "*.exe" | grep -i "Egaroucid" | head -n 1)
+          
+          if [ -z "$EGA_EXE_PATH" ]; then
+            echo "エラー: ZIP内に Egaroucid の .exe が見つかりませんでした。"
             exit 1
           fi
           
-          EGA_DIR=$(dirname "$EGA_EXE")
+          echo "Executable found at: $EGA_EXE_PATH"
+          EGA_DIR=$(dirname "$EGA_EXE_PATH")
+          
+          # exeがあるフォルダごと ega/ にリネーム
           mv "$EGA_DIR" ega
+          
+          # 実行ファイル名をJS側と一致させる
+          EGA_BASENAME=$(basename "$EGA_EXE_PATH")
+          if [ "$EGA_BASENAME" != "Egaroucid_for_Console.exe" ]; then
+            mv "ega/$EGA_BASENAME" "ega/Egaroucid_for_Console.exe"
+          fi
           echo "Egaroucid extracted successfully to ega/ directory."
 
       - name: Verify KOKUBYAKU files
