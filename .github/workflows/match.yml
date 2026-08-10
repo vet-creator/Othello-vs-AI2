@@ -94,16 +94,20 @@ jobs:
           }
           
           class Gtp {
-          constructor(binPath, args, name) {
+          constructor(binPath, args, name, cwd) {
           this.name = name;
           this.buf = '';
           this.queue = [];
-          this.proc = spawn(binPath, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+          this.proc = spawn(binPath, args, { cwd: cwd, stdio: ['pipe', 'pipe', 'pipe'] });
           this.proc.stdout.setEncoding('utf8');
-          this.proc.stdout.on('data', d => { this.buf += d.replace(/\r/g, ''); this.drain(); });
+          this.proc.stdout.on('data', d => {
+          this.buf += d.replace(/\r/g, '');
+          this.drain();
+          });
           this.proc.stderr.setEncoding('utf8');
           this.proc.stderr.on('data', d => fs.appendFileSync(`${name}.stderr.log`, d));
           this.proc.on('exit', code => {
+          console.log(`[SYS] ${name} exited with code ${code}`);
           while (this.queue.length) this.queue.shift().rej(new Error(`${name} exited: ${code}`));
           });
           }
@@ -144,13 +148,13 @@ jobs:
           this.proc = spawn(binPath, [], { stdio: ['pipe', 'pipe', 'pipe'] });
           this.buf = '';
           this.budget = budget;
-          this.kokuColor = kokuColor;
           this.humanColor = kokuColor === 1 ? 2 : 1;
           this.resolveWait = null;
           this.waitRegex = null;
           this.proc.stdout.on('data', d => {
-          this.buf += d.toString().replace(/\r/g, '');
-          fs.appendFileSync('koku.raw.log', d.toString());
+          const str = d.toString().replace(/\r/g, '');
+          fs.appendFileSync('koku.raw.log', str);
+          this.buf += str;
           this.checkWait();
           });
           this.proc.stderr.on('data', d => fs.appendFileSync('koku.err.log', d.toString()));
@@ -174,18 +178,17 @@ jobs:
           this.checkWait();
           });
           }
-          async init() {
-          await this.waitFor(/Play as Black\(1\) or White\(2\)\?/);
+          init() {
+          console.log("[SYS] Writing init config to KOKUBYAKU stdin (fire-and-forget)...");
           this.proc.stdin.write(this.humanColor + '\n');
-          await this.waitFor(/AI think time \(ms\)\?/);
           this.proc.stdin.write(this.budget + '\n');
           }
-          async sendHumanMove(moveStr) {
-          await this.waitFor(/Your move \(e\.g\. d3\):/);
-          // ★ここで必ず小文字に変換して送ることでエラー落ちを防ぎます
+          sendHumanMove(moveStr) {
+          console.log("[SYS] Writing move " + moveStr + " to KOKUBYAKU stdin...");
           this.proc.stdin.write(moveStr.toLowerCase() + '\n');
           }
           async waitAiMove() {
+          console.log("[SYS] Waiting for KOKUBYAKU to output move...");
           const m = await this.waitFor(/AI plays: ([a-hA-H][1-8])|>>> No moves\. Pass\./);
           if (m[0].includes('Pass') || m[0].includes('pass')) return 'PASS';
           return m[1].toUpperCase();
@@ -194,34 +197,45 @@ jobs:
           }
           
           async function playGame(egaColor, gameNo) {
+          console.log(`\n[SYS] --- Setting up Game ${gameNo} ---`);
           const egaPath = path.join(process.cwd(), 'ega', 'Egaroucid_for_Console.exe');
           const kokuPath = path.join(process.cwd(), 'KOKUBYAKU_Native.exe');
-          const ega = new Gtp(egaPath, ['-gtp'], 'Egaroucid');
-          await ega.send('name', 5000).catch(()=>{});
+          
+          console.log("[SYS] Spawning Egaroucid...");
+          const ega = new Gtp(egaPath, ['-gtp'], 'Egaroucid', path.join(process.cwd(), 'ega'));
+          
+          console.log("[SYS] Waiting for Egaroucid to boot (this can take 10-20s for eval files)...");
+          await ega.send('name', 60000).catch(e => console.log("Egaroucid name failed:", e.message));
           await ega.send(`time_settings 0 ${Math.max(1, Math.round(MOVE_MS / 1000))} 1`).catch(()=>{});
           await ega.send(`level ${EGA_LEVEL}`).catch(()=>{});
-          await ega.send('clear_board');
+          console.log("[SYS] Clearing Egaroucid board...");
+          await ega.send('clear_board', 60000).catch(e => console.log("Ega clear_board failed:", e.message));
+          
           const kokuColor = egaColor === 1 ? 2 : 1;
+          console.log("[SYS] Spawning KOKUBYAKU...");
           const koku = new KokubyakuInteractive(kokuPath, MOVE_MS, kokuColor);
-          await koku.init();
+          koku.init();
+          
           let turn = 1, passCount = 0;
           const moves = [];
           log(`\n=== Game ${gameNo}: Egaroucid = ${egaColor === 1 ? 'BLACK' : 'WHITE'} / Your KOKUBYAKU = ${kokuColor === 1 ? 'BLACK' : 'WHITE'} ===`);
+          
           while (passCount < 2) {
           const colorStr = turn === 1 ? 'B' : 'W';
           if (turn === egaColor) {
-          // GitHub Actions環境のスペックを考慮し、タイムアウト上限を余裕を持って10分に設定
+          console.log(`[SYS] Requesting Egaroucid move (${colorStr})...`);
           const r = await ega.send(`genmove ${colorStr}`, MOVE_MS * 10 + 600000);
           const move = r.body.split(/\s+/)[0].toUpperCase();
           if (move === 'PASS' || move === 'pass') {
           passCount++;
           log(`  ${moves.length.toString().padStart(2)} Egaroucid   ${colorStr} PASS`);
+          console.log("[SYS] Waiting for KOKUBYAKU to acknowledge pass...");
           await koku.waitFor(/>>> No moves\. Pass\./);
           } else {
           passCount = 0;
           moves.push(`${colorStr}:${move}`);
           log(`  ${moves.length.toString().padStart(2)} Egaroucid   ${colorStr} ${move}`);
-          await koku.sendHumanMove(move);
+          koku.sendHumanMove(move);
           }
           } else {
           const move = await koku.waitAiMove();
@@ -238,24 +252,30 @@ jobs:
           }
           turn = 3 - turn;
           }
+          
+          console.log("[SYS] Game loop finished. Waiting for KOKUBYAKU final score...");
           const res = await koku.waitFor(/Black\(X\):\s*(\d+)\s+White\(O\):\s*(\d+)/);
           const b = parseInt(res[1], 10);
           const w = parseInt(res[2], 10);
+          
           const egaScore = egaColor === 1 ? b : w;
           const kokuScore = kokuColor === 1 ? b : w;
           let result = 'Draw';
           if (egaScore > kokuScore) result = 'Egaroucid Win';
           else if (kokuScore > egaScore) result = 'KOKUBYAKU Win';
           log(`--- Game ${gameNo} End: Black ${b} - White ${w} / Egaroucid ${egaScore} - KOKUBYAKU ${kokuScore} => ${result}`);
+          
           ega.kill();
           koku.kill();
           return { gameNo, egaColor: egaColor === 1 ? 'black' : 'white', black: b, white: w, egaroucid: egaScore, kokubyaku: kokuScore, result, moves };
           }
           
           (async () => {
+          console.log("[SYS] Match script started.");
           fs.writeFileSync('match.log', '');
           fs.writeFileSync('gtp.log', '');
           fs.writeFileSync('koku.raw.log', '');
+          
           const results = [];
           try {
           for (let i = 0; i < GAMES; i++) {
@@ -271,6 +291,7 @@ jobs:
           fs.writeFileSync('result.json', JSON.stringify({ tally, results }, null, 2));
           log('\n===== TOTAL =====');
           log(`Egaroucid ${tally.egaroucid_wins} - ${tally.koku_wins} KOKUBYAKU (Draw ${tally.draws})`);
+          
           if (process.env.GITHUB_STEP_SUMMARY) {
           let md = '## Ultimate Native Match Result (Windows)\n\n';
           md += `**Egaroucid ${tally.egaroucid_wins} - ${tally.koku_wins} KOKUBYAKU** (Draw ${tally.draws})\n\n`;
@@ -281,6 +302,7 @@ jobs:
           fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, md);
           }
           }
+          console.log("[SYS] Match script completed successfully.");
           })().catch(e => { log('[FATAL] ' + (e && e.stack || e)); process.exit(1); });
           EOF
 
