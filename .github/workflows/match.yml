@@ -112,7 +112,8 @@ jobs:
           this.queue = [];
           this.proc = spawn(bin, args, { cwd, stdio: ['pipe', 'pipe', 'pipe'] });
           this.proc.stdout.setEncoding('utf8');
-          this.proc.stdout.on('data', d => { this.buf += d; this.drain(); });
+          // ★ここでWindowsの改行コード(\r)を削除し、Linux(\n)に統一して解釈エラーを回避
+          this.proc.stdout.on('data', d => { this.buf += d.replace(/\r/g, ''); this.drain(); });
           this.proc.stderr.setEncoding('utf8');
           this.proc.stderr.on('data', d => fs.appendFileSync(`${name}.stderr.log`, d));
           this.proc.on('exit', code => {
@@ -189,8 +190,9 @@ jobs:
           (async () => {
           fs.writeFileSync('match.log', '');
           fs.writeFileSync('gtp.log', '');
-          const ega = new Gtp('./Egaroucid_for_Console.exe', ['-gtp'], 'ega', 'Egaroucid');
-          const koku = new Gtp('./KOKUBYAKU_Native.exe', [], '.', 'KOKUBYAKU');
+          // パスの指定方法をWindowsで最も安全な形に修正
+          const ega = new Gtp('Egaroucid_for_Console.exe', ['-gtp'], 'ega', 'Egaroucid');
+          const koku = new Gtp('KOKUBYAKU_Native.exe', [], '.', 'KOKUBYAKU');
           const egaName = await ega.send('name', 5000);
           const kokuName = await koku.send('name', 5000);
           log(`[Engines] ${egaName.body} vs ${kokuName.body}`);
