@@ -1,0 +1,831 @@
+name: Ultimate Native AI Match (Egaroucid vs KOKUBYAKU)
+
+on:
+  workflow_dispatch:
+    inputs:
+      games:
+        description: "対局数(色は1局ごとに入れ替え)"
+        default: "2"
+      move_ms:
+        description: "1手の思考時間(ms) 両AI共通"
+        default: "8000"
+      ega_level:
+        description: "Egaroucidのレベル(自然数 / 推奨: 15〜30)"
+        default: "21"
+      ega_tag:
+        description: "Egaroucid for Console のタグ"
+        default: "console_v7.8.1"
+
+jobs:
+  native-match:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      GAMES: ${{ github.event.inputs.games || '2' }}
+      MOVE_MS: ${{ github.event.inputs.move_ms || '8000' }}
+      EGA_LEVEL: ${{ github.event.inputs.ega_level || '21' }}
+      EGA_TAG: ${{ github.event.inputs.ega_tag || 'console_v7.8.1' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends g++ unzip wget file
+
+      - name: Build Egaroucid for Console (Linux Native)
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch "$EGA_TAG" https://github.com/Nyanyan/Egaroucid.git ega
+          cd ega
+          mkdir -p bin
+          g++ -O3 ./src/Egaroucid_for_Console.cpp -o ./bin/Egaroucid_for_Console.out \
+              -mtune=native -march=native -mfpmath=both -pthread -std=c++20 \
+          || g++ -O3 ./src/Egaroucid_for_Console.cpp -o ./bin/Egaroucid_for_Console.out \
+              -pthread -std=c++20 -DHAS_NO_AVX2
+          if ! ls bin/resources/*.egev* >/dev/null 2>&1; then
+            echo "Fetching Windows zip to extract resources..."
+            VER="$(echo "$EGA_TAG" | sed 's/^console_v//; s/\./_/g')"
+            wget -q -O win.zip "https://github.com/Nyanyan/Egaroucid/releases/download/${EGA_TAG}/Egaroucid_for_Console_${VER}_Windows_Generic.zip"
+            unzip -q win.zip -d win
+            RES="$(find win -type d -name resources | head -n1)"
+            cp -r "$RES" bin/
+          fi
+
+      - name: Extract KOKUBYAKU Weights
+        run: |
+          cat << 'EOF' > extract.js
+          const fs = require('fs');
+          const html = fs.readFileSync('index.html', 'utf8');
+          const m = html.match(/let WDATA="([^"]+)"/);
+          if (!m) { console.error("WDATA not found"); process.exit(1); }
+          const bin = Buffer.from(m[1], 'base64').toString('binary');
+          const n = bin.length, raw = new Uint8Array(n);
+          for (let i = 0; i < n; i++) raw[i] = bin.charCodeAt(i);
+          const out = new Int16Array(6 * 167265);
+          let p = 0, o = 0;
+          while (p < n && o < out.length) {
+          let t = 0, sft = 0, b;
+          do { b = raw[p++]; t |= (b & 127) << sft; sft += 7; } while (b & 128);
+          if (t === 0) {
+          let r = 0; sft = 0;
+          do { b = raw[p++]; r |= (b & 127) << sft; sft += 7; } while (b & 128);
+          o += r;
+          } else {
+          t -= 1;
+          out[o++] = (t >>> 1) ^ (-(t & 1));
+          }
+          }
+          fs.writeFileSync('weights.bin', Buffer.from(out.buffer));
+          EOF
+          node extract.js
+
+      - name: Generate KOKUBYAKU Native Engine (GTP Mode)
+        run: |
+          cat << 'EOF' > engine.c
+          #include <stdint.h>
+          #include <string.h>
+          #include <math.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <time.h>
+          static double now_ms(void) { return (double)clock() * 1000.0 / CLOCKS_PER_SEC; }
+          typedef uint64_t u64;
+          typedef int16_t i16;
+          #define PC(x) __builtin_popcountll(x)
+          #define CTZ(x) __builtin_ctzll(x)
+          #define BLACK 1
+          #define WHITE 2
+          #define INF 1000000
+          #define MATE 29000
+          #define EVMAX 6400
+          static const u64 MIDM = 0x7E7E7E7E7E7E7E7EULL;
+          static inline u64 get_moves(u64 P, u64 O) {
+          u64 m = O & MIDM, f, r = 0;
+          f = m & (P << 1); f |= m & (f << 1); f |= m & (f << 1); f |= m & (f << 1); f |= m & (f << 1); f |= m & (f << 1); r |= f << 1;
+          f = m & (P >> 1); f |= m & (f >> 1); f |= m & (f >> 1); f |= m & (f >> 1); f |= m & (f >> 1); f |= m & (f >> 1); r |= f >> 1;
+          f = O & (P << 8); f |= O & (f << 8); f |= O & (f << 8); f |= O & (f << 8); f |= O & (f << 8); f |= O & (f << 8); r |= f << 8;
+          f = O & (P >> 8); f |= O & (f >> 8); f |= O & (f >> 8); f |= O & (f >> 8); f |= O & (f >> 8); f |= O & (f >> 8); r |= f >> 8;
+          f = m & (P << 9); f |= m & (f << 9); f |= m & (f << 9); f |= m & (f << 9); f |= m & (f << 9); f |= m & (f << 9); r |= f << 9;
+          f = m & (P >> 9); f |= m & (f >> 9); f |= m & (f >> 9); f |= m & (f >> 9); f |= m & (f >> 9); f |= m & (f >> 9); r |= f >> 9;
+          f = m & (P << 7); f |= m & (f << 7); f |= m & (f << 7); f |= m & (f << 7); f |= m & (f << 7); f |= m & (f << 7); r |= f << 7;
+          f = m & (P >> 7); f |= m & (f >> 7); f |= m & (f >> 7); f |= m & (f >> 7); f |= m & (f >> 7); f |= m & (f >> 7); r |= f >> 7;
+          return r & ~(P | O);
+          }
+          static inline u64 get_flips(u64 P, u64 O, int sq) {
+          u64 b = 1ULL << sq, m = O & MIDM, f, r = 0;
+          f = m & (b << 1); f |= m & (f << 1); f |= m & (f << 1); f |= m & (f << 1); f |= m & (f << 1); f |= m & (f << 1); if ((f << 1) & P) r |= f;
+          f = m & (b >> 1); f |= m & (f >> 1); f |= m & (f >> 1); f |= m & (f >> 1); f |= m & (f >> 1); f |= m & (f >> 1); if ((f >> 1) & P) r |= f;
+          f = O & (b << 8); f |= O & (f << 8); f |= O & (f << 8); f |= O & (f << 8); f |= O & (f << 8); f |= O & (f << 8); if ((f << 8) & P) r |= f;
+          f = O & (b >> 8); f |= O & (f >> 8); f |= O & (f >> 8); f |= O & (f >> 8); f |= O & (f >> 8); f |= O & (f >> 8); if ((f >> 8) & P) r |= f;
+          f = m & (b << 9); f |= m & (f << 9); f |= m & (f << 9); f |= m & (f << 9); f |= m & (f << 9); f |= m & (f << 9); if ((f << 9) & P) r |= f;
+          f = m & (b >> 9); f |= m & (f >> 9); f |= m & (f >> 9); f |= m & (f >> 9); f |= m & (f >> 9); f |= m & (f >> 9); if ((f >> 9) & P) r |= f;
+          f = m & (b << 7); f |= m & (f << 7); f |= m & (f << 7); f |= m & (f << 7); f |= m & (f << 7); f |= m & (f << 7); if ((f << 7) & P) r |= f;
+          f = m & (b >> 7); f |= m & (f >> 7); f |= m & (f >> 7); f |= m & (f >> 7); f |= m & (f >> 7); f |= m & (f >> 7); if ((f >> 7) & P) r |= f;
+          return r;
+          }
+          static inline u64 neighbours(u64 x) {
+          u64 m = x & MIDM;
+          return (m << 1) | (m >> 1) | (x << 8) | (x >> 8) | (m << 9) | (m >> 9) | (m << 7) | (m >> 7);
+          }
+          #define NPAT 11
+          #define MAXINST 96
+          #define NPHASE 6
+          static const int PAT_SIZE[NPAT] = { 10,9,10,8,8,8,8,7,6,5,4 };
+          static const int PAT_CELL[NPAT][10][2] = {
+          {{0,0},{0,1},{0,2},{0,3},{0,4},{0,5},{0,6},{0,7},{1,1},{1,6}},
+          {{0,0},{0,1},{0,2},{1,0},{1,1},{1,2},{2,0},{2,1},{2,2},{0,0}},
+          {{0,0},{0,1},{0,2},{0,3},{0,4},{1,0},{1,1},{1,2},{1,3},{1,4}},
+          {{1,0},{1,1},{1,2},{1,3},{1,4},{1,5},{1,6},{1,7},{0,0},{0,0}},
+          {{2,0},{2,1},{2,2},{2,3},{2,4},{2,5},{2,6},{2,7},{0,0},{0,0}},
+          {{3,0},{3,1},{3,2},{3,3},{3,4},{3,5},{3,6},{3,7},{0,0},{0,0}},
+          {{0,0},{1,1},{2,2},{3,3},{4,4},{5,5},{6,6},{7,7},{0,0},{0,0}},
+          {{0,1},{1,2},{2,3},{3,4},{4,5},{5,6},{6,7},{0,0},{0,0},{0,0}},
+          {{0,2},{1,3},{2,4},{3,5},{4,6},{5,7},{0,0},{0,0},{0,0},{0,0}},
+          {{0,3},{1,4},{2,5},{3,6},{4,7},{0,0},{0,0},{0,0},{0,0},{0,0}},
+          {{0,4},{1,5},{2,6},{3,7},{0,0},{0,0},{0,0},{0,0},{0,0},{0,0}} };
+          static int POW3[11], NINST, TOTALW, PAT_OFF[NPAT];
+          static int inst_pat[MAXINST], inst_off[MAXINST], inst_cell[MAXINST][10];
+          static int sq_n[64], sq_inst[64][20], sq_pow[64][20];
+          static int fB[MAXINST], fW[MAXINST];
+          static int PHP[65], PHQ[65], PHFI[65], MPCPH[65];
+          static void symxy(int t, int r, int c, int *R, int *C) {
+          switch (t) {
+          case 0: *R = r; *C = c; break;      case 1: *R = r; *C = 7 - c; break;
+          case 2: *R = 7 - r; *C = c; break;  case 3: *R = 7 - r; *C = 7 - c; break;
+          case 4: *R = c; *C = r; break;      case 5: *R = c; *C = 7 - r; break;
+          case 6: *R = 7 - c; *C = r; break;  default: *R = 7 - c; *C = 7 - r; break;
+          }
+          }
+          static void pat_init(void) {
+          int i, k, t, p;
+          POW3[0] = 1; for (i = 1; i < 11; i++) POW3[i] = POW3[i - 1] * 3;
+          TOTALW = 0;
+          for (p = 0; p < NPAT; p++) { PAT_OFF[p] = TOTALW; TOTALW += POW3[PAT_SIZE[p]]; }
+          NINST = 0;
+          for (p = 0; p < NPAT; p++) for (t = 0; t < 8; t++) {
+          int cells[10], n = PAT_SIZE[p], dup = 0;
+          for (k = 0; k < n; k++) { int R, C; symxy(t, PAT_CELL[p][k][0], PAT_CELL[p][k][1], &R, &C); cells[k] = R * 8 + C; }
+          for (i = 0; i < NINST && !dup; i++) {
+          if (inst_pat[i] != p) continue;
+          dup = 1;
+          for (k = 0; k < n; k++) if (inst_cell[i][k] != cells[k]) { dup = 0; break; }
+          }
+          if (dup) continue;
+          inst_pat[NINST] = p; inst_off[NINST] = PAT_OFF[p];
+          for (k = 0; k < n; k++) inst_cell[NINST][k] = cells[k];
+          NINST++;
+          }
+          for (i = 0; i < 64; i++) sq_n[i] = 0;
+          for (i = 0; i < NINST; i++) {
+          int n = PAT_SIZE[inst_pat[i]];
+          for (k = 0; k < n; k++) { int s = inst_cell[i][k], q = sq_n[s]++; sq_inst[s][q] = i; sq_pow[s][q] = POW3[k]; }
+          }
+          for (i = 0; i < 65; i++) {
+          double x = (i - 9) / 10.0; int q, pp = (int)floor(x); double fr = x - pp;
+          if (pp < 0) { pp = 0; fr = 0; } if (pp >= NPHASE - 1) { pp = NPHASE - 1; fr = 0; }
+          q = (pp < NPHASE - 1) ? pp + 1 : pp;
+          PHP[i] = pp; PHQ[i] = q; PHFI[i] = (int)(fr * 256.0 + 0.5);
+          int m = (i - 4) / 10; if (m < 0) m = 0; if (m > 5) m = 5; MPCPH[i] = m;
+          }
+          }
+          static i16 *W;
+          static inline void feat_cell(int sq, int dB, int dW) {
+          int n = sq_n[sq], k;
+          for (k = 0; k < n; k++) { int i = sq_inst[sq][k], p = sq_pow[sq][k]; fB[i] += dB * p; fW[i] += dW * p; }
+          }
+          static void feat_build(u64 Bb, u64 Wb) {
+          int i, k;
+          for (i = 0; i < NINST; i++) {
+          int n = PAT_SIZE[inst_pat[i]], vb = 0, vw = 0;
+          for (k = n - 1; k >= 0; k--) {
+          int s = inst_cell[i][k], d = ((Bb >> s) & 1) ? 1 : (((Wb >> s) & 1) ? 2 : 0);
+          vb = vb * 3 + d; vw = vw * 3 + (d ? 3 - d : 0);
+          }
+          fB[i] = vb + inst_off[i]; fW[i] = vw + inst_off[i];
+          }
+          }
+          static inline void feat_do(int sq, u64 fl, int col) {
+          if (col == BLACK) { feat_cell(sq, 1, 2); while (fl) { int s = CTZ(fl); fl &= fl - 1; feat_cell(s, -1, 1); } }
+          else { feat_cell(sq, 2, 1); while (fl) { int s = CTZ(fl); fl &= fl - 1; feat_cell(s, 1, -1); } }
+          }
+          static inline void feat_undo(int sq, u64 fl, int col) {
+          if (col == BLACK) { feat_cell(sq, -1, -2); while (fl) { int s = CTZ(fl); fl &= fl - 1; feat_cell(s, 1, -1); } }
+          else { feat_cell(sq, -2, -1); while (fl) { int s = CTZ(fl); fl &= fl - 1; feat_cell(s, -1, 1); } }
+          }
+          static inline int eval_pat(int col, int nd) {
+          const i16 *w0 = W + (size_t)PHP[nd] * TOTALW, *w1 = W + (size_t)PHQ[nd] * TOTALW;
+          const int *f = (col == BLACK) ? fB : fW;
+          int fr = PHFI[nd], gr = 256 - fr, s = 0, i;
+          for (i = 0; i < NINST; i++) { int k = f[i]; s += w0[k] * gr + w1[k] * fr; }
+          s >>= 8;
+          return s > EVMAX ? EVMAX : (s < -EVMAX ? -EVMAX : s);
+          }
+          static uint8_t ESTAB[65536];
+          static void stab_init(void) {
+          int a, p;
+          for (a = 0; a < 256; a++) for (p = 0; p < 256; p++) {
+          int m = 0;
+          if (p & ~a) { ESTAB[(p << 8) | a] = 0; continue; }
+          if (a == 255) m = p;
+          else {
+          int i = 0, j = 7;
+          while (i < 8 && ((p >> i) & 1)) { m |= 1 << i; i++; }
+          while (j >= 0 && ((p >> j) & 1)) { m |= 1 << j; j--; }
+          }
+          ESTAB[(p << 8) | a] = (uint8_t)m;
+          }
+          }
+          static inline int colbyte(u64 x, int c) {
+          int b = 0, r;
+          for (r = 0; r < 8; r++) if ((x >> (r * 8 + c)) & 1) b |= 1 << r;
+          return b;
+          }
+          static int stable_count(u64 P, u64 A) {
+          u64 st = 0; int m, r;
+          st |= (u64)ESTAB[((P & 255) << 8) | (A & 255)];
+          st |= (u64)ESTAB[((int)((P >> 56) & 255) << 8) | (int)((A >> 56) & 255)] << 56;
+          m = ESTAB[(colbyte(P, 0) << 8) | colbyte(A, 0)];
+          for (r = 0; r < 8; r++) if ((m >> r) & 1) st |= 1ULL << (r * 8);
+          m = ESTAB[(colbyte(P, 7) << 8) | colbyte(A, 7)];
+          for (r = 0; r < 8; r++) if ((m >> r) & 1) st |= 1ULL << (r * 8 + 7);
+          return PC(st);
+          }
+          #ifndef TTBITS
+          #define TTBITS 26
+          #endif
+          #define TTSIZE (1<<TTBITS)
+          #define TTMASK (TTSIZE-1)
+          typedef struct { u64 key; i16 lo, hi; int8_t depth; uint8_t move, gen; } TTE;
+          static TTE *TT;
+          static uint8_t ttgen = 1;
+          static u64 ZK[64][2], ZTURN;
+          static void zob_init(void) {
+          u64 s = 88172645463325252ULL; int i, j;
+          for (i = 0; i < 64; i++) for (j = 0; j < 2; j++) { s ^= s << 13; s ^= s >> 7; s ^= s << 17; ZK[i][j] = s; }
+          s ^= s << 13; s ^= s >> 7; s ^= s << 17; ZTURN = s;
+          }
+          static u64 zhash(u64 P, u64 O, int col) {
+          u64 h = 0, x = P;
+          while (x) { int s = CTZ(x); x &= x - 1; h ^= ZK[s][0]; }
+          x = O;
+          while (x) { int s = CTZ(x); x &= x - 1; h ^= ZK[s][1]; }
+          if (col == WHITE) h ^= ZTURN;
+          return h;
+          }
+          static void tt_new(void) { ttgen++; if (!ttgen) ttgen = 1; }
+          static const int SQV[64] = {
+          90,-12, 12,  4,  4, 12,-12, 90, -12,-30, -2, -2, -2, -2,-30,-12,
+          12, -2,  6,  1,  1,  6, -2, 12,   4, -2,  1,  0,  0,  1, -2,  4,
+          4, -2,  1,  0,  0,  1, -2,  4,  12, -2,  6,  1,  1,  6, -2, 12,
+          -12,-30, -2, -2, -2, -2,-30,-12,  90,-12, 12,  4,  4, 12,-12, 90 };
+          static const int QUAD[64] = {
+          0,0,0,0,1,1,1,1, 0,0,0,0,1,1,1,1, 0,0,0,0,1,1,1,1, 0,0,0,0,1,1,1,1,
+          2,2,2,2,3,3,3,3, 2,2,2,2,3,3,3,3, 2,2,2,2,3,3,3,3, 2,2,2,2,3,3,3,3 };
+          static const int MPCD[22] = { 0,0,0,0,2,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10 };
+          static const int MPCSIG[22][6]={
+          {0,0,0,0,0,0},{0,0,0,0,0,0},{0,0,0,0,0,0},{0,0,0,0,0,0},{0,0,0,0,0,0},
+          {320,425,514,583,549,549},{320,452,542,555,486,486},{335,548,678,624,434,434},
+          {320,676,551,614,450,450},{320,722,496,609,565,565},{320,561,386,505,565,565},
+          {320,452,435,568,612,612},{418,386,472,643,609,609},{482,445,544,711,696,696},
+          {497,460,559,726,711,711},{512,475,574,741,726,726},{527,490,589,756,741,741},
+          {542,505,604,771,756,756},{557,520,619,786,771,771},{572,535,634,801,786,786},
+          {587,550,649,816,801,801},{595,558,657,824,809,809}};
+          static const int MPC_MIN = 5, MPC_MAX = 21;
+          static int USE_MPC = 1, USE_LMR = 1;
+          static double g_deadline = 0;
+          static long long g_nodes = 0;
+          static int g_abort = 0;
+          static int KILL1[128], KILL2[128];
+          static inline int timeup(void) {
+          if ((g_nodes & 2047) == 0 && now_ms() > g_deadline) g_abort = 1;
+          return g_abort;
+          }
+          static int search(u64 P, u64 O, int col, int depth, int alpha, int beta, int ply, int nd, int pass) {
+          g_nodes++;
+          if (timeup()) return 0;
+          if (depth <= 0) return eval_pat(col, nd);
+          u64 mv = get_moves(P, O);
+          if (!mv) {
+          if (pass) { int d = PC(P) - PC(O); return d > 0 ? MATE + d : (d < 0 ? -MATE + d : 0); }
+          return -search(O, P, 3 - col, depth, -beta, -alpha, ply + 1, nd, 1);
+          }
+          u64 key = zhash(P, O, col); int ix = key & TTMASK; TTE *e = &TT[ix];
+          int ttmove = 64;
+          if (e->key == key && e->gen == ttgen) {
+          ttmove = e->move;
+          if (e->depth >= depth) {
+          if (e->lo >= beta) return e->lo;
+          if (e->hi <= alpha) return e->hi;
+          if (e->lo == e->hi) return e->lo;
+          if (e->lo > alpha) alpha = e->lo;
+          if (e->hi < beta) beta = e->hi;
+          }
+          }
+          if (USE_MPC && depth >= MPC_MIN && depth <= MPC_MAX && alpha > -EVMAX && beta < EVMAX) {
+          int sg = MPCSIG[depth][MPCPH[nd]];
+          if (sg > 0) {
+          int d2 = MPCD[depth], m = sg * 17 / 10, bb = beta + m, aa = alpha - m;
+          if (bb < EVMAX && search(P, O, col, d2, bb - 1, bb, ply, nd, 0) >= bb) { if (g_abort) return 0; return beta; }
+          if (g_abort) return 0;
+          if (aa > -EVMAX && search(P, O, col, d2, aa, aa + 1, ply, nd, 0) <= aa) { if (g_abort) return 0; return alpha; }
+          if (g_abort) return 0;
+          }
+          }
+          int sq[36], sc[36], n = 0, i; u64 fl[36], x = mv;
+          while (x) { int s = CTZ(x); x &= x - 1; sq[n] = s; fl[n] = get_flips(P, O, s); n++; }
+          int k1 = KILL1[ply], k2 = KILL2[ply], deep = depth >= 3, vdeep = depth >= 5;
+          for (i = 0; i < n; i++) {
+          int s = sq[i], v = SQV[s];
+          if (s == ttmove) v += 1 << 20;
+          else {
+          u64 nP = P | fl[i] | (1ULL << s), nO = O & ~fl[i];
+          if (deep) {
+          v -= 14 * PC(get_moves(nO, nP));
+          if (vdeep) v -= 2 * PC(neighbours(nP) & ~(nP | nO));
+          } else v -= (int)PC(fl[i]);
+          if (s == k1) v += 1 << 15; else if (s == k2) v += 1 << 14;
+          }
+          sc[i] = v;
+          }
+          int a0 = alpha, best = -INF, bmove = sq[0];
+          for (i = 0; i < n; i++) {
+          int bj = i, j, s; u64 f;
+          for (j = i + 1; j < n; j++) if (sc[j] > sc[bj]) bj = j;
+          if (bj != i) { int t; u64 tu;
+          t = sq[i]; sq[i] = sq[bj]; sq[bj] = t; t = sc[i]; sc[i] = sc[bj]; sc[bj] = t;
+          tu = fl[i]; fl[i] = fl[bj]; fl[bj] = tu; }
+          s = sq[i]; f = fl[i];
+          u64 nP = P | f | (1ULL << s), nO = O & ~f;
+          int v;
+          feat_do(s, f, col);
+          if (i == 0) v = -search(nO, nP, 3 - col, depth - 1, -beta, -alpha, ply + 1, nd + 1, 0);
+          else {
+          int red = 0;
+          if (USE_LMR && depth >= 5 && i >= 3 && sc[i] < (1 << 14)) red = (i >= 8 && depth >= 7) ? 2 : 1;
+          v = -search(nO, nP, 3 - col, depth - 1 - red, -alpha - 1, -alpha, ply + 1, nd + 1, 0);
+          if (!g_abort && red && v > alpha) v = -search(nO, nP, 3 - col, depth - 1, -alpha - 1, -alpha, ply + 1, nd + 1, 0);
+          if (!g_abort && v > alpha && v < beta) v = -search(nO, nP, 3 - col, depth - 1, -beta, -alpha, ply + 1, nd + 1, 0);
+          }
+          feat_undo(s, f, col);
+          if (g_abort) return 0;
+          if (v > best) {
+          best = v; bmove = s;
+          if (v > alpha) {
+          alpha = v;
+          if (alpha >= beta) { if (s != KILL1[ply]) { KILL2[ply] = KILL1[ply]; KILL1[ply] = s; } break; }
+          }
+          }
+          }
+          e = &TT[ix];
+          if (e->gen != ttgen || e->depth <= depth) {
+          e->key = key; e->depth = depth; e->move = bmove; e->gen = ttgen;
+          if (best <= a0) { e->lo = -32000; e->hi = best; }
+          else if (best >= beta) { e->lo = best; e->hi = 32000; }
+          else { e->lo = best; e->hi = best; }
+          }
+          return best;
+          }
+          static inline int final_diff(u64 P, u64 O, int e) {
+          int d = PC(P) - PC(O);
+          if (d > 0) d += e; else if (d < 0) d -= e;
+          return d;
+          }
+          static int solve_tiny(u64 P, u64 O, int e, int alpha, int beta, int pass) {
+          g_nodes++;
+          u64 emp = ~(P | O); int best = -INF;
+          while (emp) {
+          int s = CTZ(emp); emp &= emp - 1;
+          u64 f = get_flips(P, O, s);
+          if (!f) continue;
+          u64 nP = P | f | (1ULL << s), nO = O & ~f;
+          int v = (e == 1) ? -final_diff(nO, nP, 0) : -solve_tiny(nO, nP, e - 1, -beta, -alpha, 0);
+          if (v > best) { best = v; if (v > alpha) { alpha = v; if (alpha >= beta) return best; } }
+          }
+          if (best == -INF) {
+          if (pass) return final_diff(P, O, e);
+          return -solve_tiny(O, P, e, -beta, -alpha, 1);
+          }
+          return best;
+          }
+          static int solve_e(u64 P, u64 O, int e, int alpha, int beta, int ply, int par, int pass) {
+          if (e <= 6) return solve_tiny(P, O, e, alpha, beta, pass);
+          g_nodes++;
+          if (timeup()) return 0;
+          u64 A = P | O, mv = get_moves(P, O);
+          if (!mv) {
+          if (pass) return final_diff(P, O, e);
+          return -solve_e(O, P, e, -beta, -alpha, ply + 1, par, 1);
+          }
+          if (e <= 20) {
+          int ub = 64 - 2 * stable_count(O, A);
+          if (ub <= alpha) return ub;
+          if (ub < beta) { beta = ub; if (alpha >= beta) return ub; }
+          }
+          int useTT = e >= 10, ix = 0, ttmove = 64; u64 key = 0; TTE *ent = 0;
+          if (useTT) {
+          key = zhash(P, O, BLACK) ^ (u64)e; ix = key & TTMASK; ent = &TT[ix];
+          if (ent->key == key && ent->gen == ttgen) {
+          ttmove = ent->move;
+          if (ent->depth >= e) {
+          if (ent->lo >= beta) return ent->lo;
+          if (ent->hi <= alpha) return ent->hi;
+          if (ent->lo == ent->hi) return ent->lo;
+          if (ent->lo > alpha) alpha = ent->lo;
+          if (ent->hi < beta) beta = ent->hi;
+          }
+          }
+          }
+          int sq[36], sc[36], n = 0, i; u64 fl[36], x = mv;
+          while (x) { int s = CTZ(x); x &= x - 1; sq[n] = s; fl[n] = get_flips(P, O, s); n++; }
+          int wide = e >= 12;
+          for (i = 0; i < n; i++) {
+          int s = sq[i], v = ((par >> QUAD[s]) & 1) ? 128 : 0;
+          if (s == ttmove) v += 1 << 20;
+          else {
+          u64 nP = P | fl[i] | (1ULL << s), nO = O & ~fl[i];
+          v += (SQV[s] >> 2) - (int)PC(get_moves(nO, nP)) * (wide ? 12 : 6);
+          if (wide) v -= 2 * (int)PC(neighbours(nP) & ~(nP | nO));
+          }
+          sc[i] = v;
+          }
+          int a0 = alpha, best = -INF, bmove = sq[0];
+          for (i = 0; i < n; i++) {
+          int bj = i, j, s; u64 f;
+          for (j = i + 1; j < n; j++) if (sc[j] > sc[bj]) bj = j;
+          if (bj != i) { int t; u64 tu;
+          t = sq[i]; sq[i] = sq[bj]; sq[bj] = t; t = sc[i]; sc[i] = sc[bj]; sc[bj] = t;
+          tu = fl[i]; fl[i] = fl[bj]; fl[bj] = tu; }
+          s = sq[i]; f = fl[i];
+          u64 nP = P | f | (1ULL << s), nO = O & ~f;
+          int np = par ^ (1 << QUAD[s]), v;
+          if (i == 0) v = -solve_e(nO, nP, e - 1, -beta, -alpha, ply + 1, np, 0);
+          else {
+          v = -solve_e(nO, nP, e - 1, -alpha - 1, -alpha, ply + 1, np, 0);
+          if (!g_abort && v > alpha && v < beta) v = -solve_e(nO, nP, e - 1, -beta, -alpha, ply + 1, np, 0);
+          }
+          if (g_abort) return 0;
+          if (v > best) { best = v; bmove = s; if (v > alpha) { alpha = v; if (alpha >= beta) break; } }
+          }
+          if (useTT && (ent->gen != ttgen || ent->depth <= e)) {
+          ent->key = key; ent->depth = e; ent->move = bmove; ent->gen = ttgen;
+          if (best <= a0) { ent->lo = -100; ent->hi = best; }
+          else if (best >= beta) { ent->lo = best; ent->hi = 100; }
+          else { ent->lo = best; ent->hi = best; }
+          }
+          return best;
+          }
+          static int parity_of(u64 A) {
+          int p = 0, q, s;
+          for (q = 0; q < 4; q++) { int c = 0;
+          for (s = 0; s < 64; s++) if (QUAD[s] == q && !((A >> s) & 1)) c++;
+          if (c & 1) p |= 1 << q; }
+          return p;
+          }
+          static int R_score, R_depth;
+          static void sync_feat(u64 P, u64 O, int col) {
+          if (col == BLACK) feat_build(P, O); else feat_build(O, P);
+          }
+          static int root_go(u64 P, u64 O, int col, double budget) {
+          u64 A = P | O, mv = get_moves(P, O);
+          int nd = PC(A), empties = 64 - nd, i;
+          if (!mv) return -1;
+          int sq[36], n = 0, sc[36]; u64 fl[36], x = mv;
+          while (x) { int s = CTZ(x); x &= x - 1; sq[n] = s; fl[n] = get_flips(P, O, s); n++; }
+          R_score = 0; R_depth = 0; g_nodes = 0; g_abort = 0;
+          if (n == 1) return sq[0];
+          double t0 = now_ms();
+          for (i = 0; i < 128; i++) { KILL1[i] = -1; KILL2[i] = -1; }
+          int exactTh = budget >= 7000 ? 22 : (budget >= 2500 ? 20 : 18);
+          int wldTh = budget >= 7000 ? 26 : (budget >= 2500 ? 24 : 22);
+          int bestsq = sq[0];
+          if (empties <= wldTh) {
+          tt_new(); sync_feat(P, O, col);
+          g_deadline = t0 + budget * 0.30;
+          int pd = empties - 10; if (pd < 4) pd = 4; if (pd > 10) pd = 10;
+          int alpha = -INF;
+          for (i = 0; i < n; i++) {
+          u64 nP = P | fl[i] | (1ULL << sq[i]), nO = O & ~fl[i];
+          feat_do(sq[i], fl[i], col);
+          sc[i] = -search(nO, nP, 3 - col, pd - 1, -INF, -alpha, 1, nd + 1, 0);
+          feat_undo(sq[i], fl[i], col);
+          if (sc[i] > alpha) alpha = sc[i];
+          }
+          g_abort = 0;
+          for (i = 0; i < n; i++) { int bj = i, j; for (j = i + 1; j < n; j++) if (sc[j] > sc[bj]) bj = j;
+          if (bj != i) { int t; u64 tu; t = sq[i]; sq[i] = sq[bj]; sq[bj] = t;
+          t = sc[i]; sc[i] = sc[bj]; sc[bj] = t; tu = fl[i]; fl[i] = fl[bj]; fl[bj] = tu; } }
+          int par = parity_of(A);
+          if (empties <= exactTh) {
+          tt_new(); g_deadline = t0 + budget * 1.25;
+          int a = -65, best = -INF, bs = sq[0];
+          for (i = 0; i < n; i++) {
+          u64 nP = P | fl[i] | (1ULL << sq[i]), nO = O & ~fl[i];
+          int np = par ^ (1 << QUAD[sq[i]]), v;
+          if (i == 0) v = -solve_e(nO, nP, empties - 1, -65, -a, 1, np, 0);
+          else {
+          v = -solve_e(nO, nP, empties - 1, -a - 1, -a, 1, np, 0);
+          if (!g_abort && v > a && v < 65) v = -solve_e(nO, nP, empties - 1, -65, -a, 1, np, 0);
+          }
+          if (g_abort) break;
+          if (v > best) { best = v; bs = sq[i]; if (v > a) a = v; }
+          }
+          if (!g_abort) { R_score = best; R_depth = empties; return bs; }
+          g_abort = 0;
+          }
+          g_deadline = t0 + budget * 1.95;
+          int pass2;
+          for (pass2 = 0; pass2 < 2; pass2++) {
+          int lo = pass2 == 0 ? 0 : -1, hi = pass2 == 0 ? 1 : 0;
+          tt_new();
+          for (i = 0; i < n; i++) {
+          u64 nP = P | fl[i] | (1ULL << sq[i]), nO = O & ~fl[i];
+          int v = -solve_e(nO, nP, empties - 1, -hi, -lo, 1, par ^ (1 << QUAD[sq[i]]), 0);
+          if (g_abort) break;
+          if (v >= hi) { R_score = pass2 == 0 ? 1 : 0; R_depth = empties; return sq[i]; }
+          }
+          if (g_abort) break;
+          }
+          if (!g_abort) { R_score = -1; R_depth = empties; return sq[0]; }
+          g_abort = 0;
+          }
+          tt_new(); sync_feat(P, O, col);
+          double t1 = now_ms();
+          double softEnd = t1 + budget * 0.40;
+          g_deadline = t1 + budget * 0.95;
+          int maxd = empties > 34 ? 34 : empties, d, done = 0, bscore = 0;
+          for (d = 2; d <= maxd; d++) {
+          if (d > 3 && now_ms() > softEnd) break;
+          int alpha = -INF, ibest = -INF, isq = -1, comp = 0;
+          for (i = 0; i < n; i++) {
+          u64 nP = P | fl[i] | (1ULL << sq[i]), nO = O & ~fl[i];
+          int v;
+          feat_do(sq[i], fl[i], col);
+          if (i == 0) v = -search(nO, nP, 3 - col, d - 1, -INF, INF, 1, nd + 1, 0);
+          else {
+          v = -search(nO, nP, 3 - col, d - 1, -alpha - 1, -alpha, 1, nd + 1, 0);
+          if (!g_abort && v > alpha) v = -search(nO, nP, 3 - col, d - 1, -INF, -alpha, 1, nd + 1, 0);
+          }
+          feat_undo(sq[i], fl[i], col);
+          if (g_abort) break;
+          sc[i] = v; comp++;
+          if (v > ibest) { ibest = v; isq = sq[i]; if (v > alpha) alpha = v; }
+          }
+          if (g_abort) {
+          if (comp > 0 && (done == 0 || ibest > bscore)) { bestsq = isq; bscore = ibest; done = d; }
+          break;
+          }
+          for (i = 0; i < n; i++) { int bj = i, j; for (j = i + 1; j < n; j++) if (sc[j] > sc[bj]) bj = j;
+          if (bj != i) { int t; u64 tu; t = sq[i]; sq[i] = sq[bj]; sq[bj] = t;
+          t = sc[i]; sc[i] = sc[bj]; sc[bj] = t; tu = fl[i]; fl[i] = fl[bj]; fl[bj] = tu; } }
+          bestsq = isq; bscore = ibest; done = d;
+          if (ibest >= MATE - 200 || ibest <= -MATE + 200) break;
+          }
+          R_score = bscore; R_depth = done;
+          return bestsq;
+          }
+          static i16 WBUF[NPHASE * 167265];
+          static int inited = 0;
+          void e_init(void) {
+          if (!inited) { pat_init(); stab_init(); zob_init(); W = WBUF; TT = (TTE*)calloc(TTSIZE, sizeof(TTE)); inited = 1; }
+          }
+          short *e_wptr(void) { return WBUF; }
+          int main(void) {
+          e_init();
+          FILE *f = fopen("weights.bin", "rb");
+          if(f) {
+          fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+          fread(e_wptr(), 1, sz, f); fclose(f);
+          }
+          setbuf(stdout, NULL);
+          char line[256];
+          u64 b = (1ULL<<28)|(1ULL<<35), w = (1ULL<<27)|(1ULL<<36);
+          int budget = 8000;
+          while(fgets(line, sizeof(line), stdin)) {
+          char cmd[256];
+          if(sscanf(line, "%s", cmd) != 1) continue;
+          if(strcmp(cmd, "name") == 0) printf("= KOKUBYAKU\n\n");
+          else if(strcmp(cmd, "version") == 0) printf("= 1.0\n\n");
+          else if(strcmp(cmd, "protocol_version") == 0) printf("= 2\n\n");
+          else if(strcmp(cmd, "quit") == 0) { printf("=\n\n"); break; }
+          else if(strcmp(cmd, "clear_board") == 0) {
+          b = (1ULL<<28)|(1ULL<<35); w = (1ULL<<27)|(1ULL<<36);
+          printf("=\n\n");
+          }
+          else if(strcmp(cmd, "kokubyaku_time") == 0) {
+          int m;
+          if(sscanf(line, "%*s %d", &m) == 1) budget = m;
+          printf("=\n\n");
+          }
+          else if(strcmp(cmd, "play") == 0) {
+          char c[10], v[10];
+          if(sscanf(line, "%*s %s %s", c, v) == 2) {
+          if (strcmp(v, "PASS") != 0 && strcmp(v, "pass") != 0) {
+          int col = (c[0]=='B'||c[0]=='b') ? 1 : 2;
+          int x = v[0] - (v[0]>='a'? 'a' : 'A');
+          int y = v[1] - '1';
+          int sq = y * 8 + x;
+          u64 P = (col==1)?b:w;
+          u64 O = (col==1)?w:b;
+          u64 fl = get_flips(P, O, sq);
+          P |= fl | (1ULL<<sq);
+          O &= ~fl;
+          if(col==1){ b=P; w=O; } else { b=O; w=P; }
+          }
+          }
+          printf("=\n\n");
+          }
+          else if(strcmp(cmd, "genmove") == 0) {
+          char c[10];
+          if(sscanf(line, "%*s %s", c) == 1) {
+          int col = (c[0]=='B'||c[0]=='b') ? 1 : 2;
+          u64 P = (col==1)?b:w;
+          u64 O = (col==1)?w:b;
+          u64 moves = get_moves(P, O);
+          if(!moves) {
+          printf("= PASS\n\n");
+          } else {
+          int sq = root_go(P, O, col, budget);
+          if(sq >= 0 && sq < 64) {
+          u64 fl = get_flips(P, O, sq);
+          P |= fl | (1ULL<<sq);
+          O &= ~fl;
+          if(col==1){ b=P; w=O; } else { b=O; w=P; }
+          printf("= %c%c\n\n", (sq%8)+'A', (sq/8)+'1');
+          } else {
+          printf("? engine error\n\n");
+          }
+          }
+          } else printf("? missing color\n\n");
+          }
+          else if(strcmp(cmd, "count") == 0) {
+          printf("= B: %d W: %d\n\n", PC(b), PC(w));
+          }
+          else printf("=\n\n");
+          }
+          return 0;
+          }
+          EOF
+
+      - name: Compile KOKUBYAKU (Linux Native)
+        run: |
+          gcc -O3 -mavx2 -mbmi2 -mpopcnt -flto -DTTBITS=26 engine.c -o KOKUBYAKU_Native.out -lm
+
+      - name: Write Node.js Match Driver
+        run: |
+          cat << 'EOF' > match-driver.js
+          'use strict';
+          const { spawn } = require('child_process');
+          const fs = require('fs');
+          const GAMES = parseInt(process.env.GAMES || '2', 10);
+          const MOVE_MS = parseInt(process.env.MOVE_MS || '8000', 10);
+          const EGA_LEVEL = parseInt(process.env.EGA_LEVEL || '21', 10);
+          function log(...a) {
+          const s = a.join(' ');
+          console.log(s);
+          fs.appendFileSync('match.log', s + '\n');
+          }
+          class Gtp {
+          constructor(bin, args, cwd, name) {
+          this.name = name;
+          this.buf = '';
+          this.queue = [];
+          this.proc = spawn(bin, args, { cwd, stdio: ['pipe', 'pipe', 'pipe'] });
+          this.proc.stdout.setEncoding('utf8');
+          this.proc.stdout.on('data', d => { this.buf += d; this.drain(); });
+          this.proc.stderr.setEncoding('utf8');
+          this.proc.stderr.on('data', d => fs.appendFileSync(`${name}.stderr.log`, d));
+          this.proc.on('exit', code => {
+          while (this.queue.length) this.queue.shift().rej(new Error(`${name} exited: ${code}`));
+          });
+          }
+          drain() {
+          for (;;) {
+          const m = this.buf.match(/(^|\n)[=?]/);
+          if (!m) { if (this.buf.length > 1 << 20) this.buf = this.buf.slice(-4096); return; }
+          const from = m.index + m[1].length;
+          const end = this.buf.indexOf('\n\n', from);
+          if (end < 0) return;
+          const chunk = this.buf.slice(from, end);
+          this.buf = this.buf.slice(end + 2);
+          const ok = chunk[0] === '=';
+          const body = chunk.replace(/^[=?]\s*\d*\s?/, '').trim();
+          const w = this.queue.shift();
+          if (w) w.res({ ok, body });
+          }
+          }
+          send(cmd, timeoutMs = 600000) {
+          return new Promise((res, rej) => {
+          const t = setTimeout(() => rej(new Error(`GTP timeout on ${this.name}: ${cmd}`)), timeoutMs);
+          this.queue.push({
+          res: v => { clearTimeout(t); res(v); },
+          rej: e => { clearTimeout(t); rej(e); }
+          });
+          fs.appendFileSync('gtp.log', `${this.name} > ${cmd}\n`);
+          this.proc.stdin.write(cmd + '\n');
+          }).then(v => {
+          fs.appendFileSync('gtp.log', `${this.name} < ${v.ok ? '=' : '?'} ${v.body}\n`);
+          return v;
+          });
+          }
+          }
+          async function playGame(ega, koku, egaColor, gameNo) {
+          await ega.send('clear_board');
+          await koku.send('clear_board');
+          let turn = 1, passCount = 0;
+          const moves = [];
+          log(`\n=== Game ${gameNo}: Egaroucid = ${egaColor === 1 ? 'BLACK' : 'WHITE'} / KOKUBYAKU = ${egaColor === 1 ? 'WHITE' : 'BLACK'} ===`);
+          while (passCount < 2) {
+          const colorStr = turn === 1 ? 'B' : 'W';
+          const engine = (turn === egaColor) ? ega : koku;
+          const opponent = (turn === egaColor) ? koku : ega;
+          const r = await engine.send(`genmove ${colorStr}`, MOVE_MS * 5 + 120000);
+          if (!r.ok) throw new Error(`${engine.name} genmove failed: ${r.body}`);
+          const move = r.body.split(/\s+/)[0].toUpperCase();
+          if (move === 'PASS' || move === 'pass') {
+          passCount++;
+          log(`  ${moves.length.toString().padStart(2)} ${engine.name.padEnd(10)} ${colorStr} PASS`);
+          await opponent.send(`play ${colorStr} PASS`);
+          } else {
+          passCount = 0;
+          moves.push(`${colorStr}:${move}`);
+          log(`  ${moves.length.toString().padStart(2)} ${engine.name.padEnd(10)} ${colorStr} ${move}`);
+          await opponent.send(`play ${colorStr} ${move}`);
+          }
+          turn = 3 - turn;
+          }
+          const kokuCountRes = await koku.send('count');
+          const m = kokuCountRes.body.match(/B: (\d+) W: (\d+)/);
+          let b = 0, w = 0;
+          if (m) { b = parseInt(m[1], 10); w = parseInt(m[2], 10); }
+          const egaScore = egaColor === 1 ? b : w;
+          const kokuScore = egaColor === 1 ? w : b;
+          let result = 'Draw';
+          if (egaScore > kokuScore) result = 'Egaroucid Win';
+          else if (kokuScore > egaScore) result = 'KOKUBYAKU Win';
+          log(`--- Game ${gameNo} End: Black ${b} - White ${w} / Egaroucid ${egaScore} - KOKUBYAKU ${kokuScore} => ${result}`);
+          return { gameNo, egaColor: egaColor === 1 ? 'black' : 'white', black: b, white: w, egaroucid: egaScore, kokubyaku: kokuScore, result, moves };
+          }
+          (async () => {
+          fs.writeFileSync('match.log', '');
+          fs.writeFileSync('gtp.log', '');
+          const ega = new Gtp('./Egaroucid_for_Console.out', ['-gtp'], 'ega/bin', 'Egaroucid');
+          const koku = new Gtp('./KOKUBYAKU_Native.out', [], '.', 'KOKUBYAKU');
+          const egaName = await ega.send('name', 5000);
+          const kokuName = await koku.send('name', 5000);
+          log(`[Engines] ${egaName.body} vs ${kokuName.body}`);
+          await ega.send(`time_settings 0 ${Math.max(1, Math.round(MOVE_MS / 1000))} 1`).catch(()=>{});
+          await ega.send(`level ${EGA_LEVEL}`).catch(()=>{});
+          await koku.send(`kokubyaku_time ${MOVE_MS}`);
+          const results = [];
+          try {
+          for (let i = 0; i < GAMES; i++) {
+          results.push(await playGame(ega, koku, i % 2 === 0 ? 1 : 2, i + 1));
+          }
+          } finally {
+          const tally = { games: results.length, egaroucid_wins: 0, koku_wins: 0, draws: 0 };
+          for (const r of results) {
+          if (r.result.includes('Egaroucid Win')) tally.egaroucid_wins++;
+          else if (r.result.includes('KOKUBYAKU Win')) tally.koku_wins++;
+          else tally.draws++;
+          }
+          fs.writeFileSync('result.json', JSON.stringify({ tally, results }, null, 2));
+          log('\n===== TOTAL =====');
+          log(`Egaroucid ${tally.egaroucid_wins} - ${tally.koku_wins} KOKUBYAKU (Draw ${tally.draws})`);
+          if (process.env.GITHUB_STEP_SUMMARY) {
+          let md = '## Ultimate Native Match Result\n\n';
+          md += `**Egaroucid ${tally.egaroucid_wins} - ${tally.koku_wins} KOKUBYAKU** (Draw ${tally.draws})\n\n`;
+          md += `* Time limit per move: ${MOVE_MS} ms\n`;
+          md += `* Egaroucid Level: ${EGA_LEVEL}\n\n`;
+          md += '| Game | Egaroucid | Black | White | Result |\n|:---:|:---:|:---:|:---:|:---|\n';
+          for (const r of results) md += `| ${r.gameNo} | ${r.egaColor} | ${r.black} | ${r.white} | **${r.result}** |\n`;
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, md);
+          }
+          try { await ega.send('quit', 2000); } catch(e){}
+          try { await koku.send('quit', 2000); } catch(e){}
+          }
+          })().catch(e => { log('[FATAL] ' + (e && e.stack || e)); process.exit(1); });
+          EOF
+
+      - name: Run Match
+        run: node match-driver.js
+
+      - name: Upload Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: othello-match-logs
+          path: |
+            match.log
+            gtp.log
+            Egaroucid.stderr.log
+            result.json
+          if-no-files-found: warn
