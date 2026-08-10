@@ -53,7 +53,6 @@ jobs:
           curl -sL -o ega.zip "$DOWNLOAD_URL"
           unzip -q ega.zip -d ega_temp
           
-          # exeファイルの自動検索と配置
           EGA_EXE_PATH=$(find ega_temp -iname "*.exe" | grep -i "Egaroucid" | head -n 1)
           if [ -z "$EGA_EXE_PATH" ]; then
             echo "エラー: ZIP内に Egaroucid の .exe が見つかりませんでした。"
@@ -65,7 +64,7 @@ jobs:
           if [ "$EGA_BASENAME" != "Egaroucid_for_Console.exe" ]; then
             mv "ega/$EGA_BASENAME" "ega/Egaroucid_for_Console.exe"
           fi
-          echo "Egaroucid successfully prepared."
+          echo "Egaroucid extracted successfully to ega/ directory."
 
       - name: Verify Your Custom Engine
         shell: bash
@@ -89,216 +88,199 @@ jobs:
           const EGA_LEVEL = parseInt(process.env.EGA_LEVEL || '21', 10);
           
           function log(...a) {
-            const s = a.join(' ');
-            console.log(s);
-            fs.appendFileSync('match.log', s + '\n');
+          const s = a.join(' ');
+          console.log(s);
+          fs.appendFileSync('match.log', s + '\n');
           }
           
-          // Egaroucid用 GTPクライアント
           class Gtp {
-            constructor(binPath, args, name) {
-              this.name = name;
-              this.buf = '';
-              this.queue = [];
-              this.proc = spawn(binPath, args, { stdio: ['pipe', 'pipe', 'pipe'] });
-              this.proc.stdout.setEncoding('utf8');
-              this.proc.stdout.on('data', d => { this.buf += d.replace(/\r/g, ''); this.drain(); });
-              this.proc.stderr.setEncoding('utf8');
-              this.proc.stderr.on('data', d => fs.appendFileSync(`${name}.stderr.log`, d));
-              this.proc.on('exit', code => {
-                while (this.queue.length) this.queue.shift().rej(new Error(`${name} exited: ${code}`));
-              });
-            }
-            drain() {
-              for (;;) {
-                const m = this.buf.match(/(^|\n)[=?]/);
-                if (!m) { if (this.buf.length > 1 << 20) this.buf = this.buf.slice(-4096); return; }
-                const from = m.index + m[1].length;
-                const end = this.buf.indexOf('\n\n', from);
-                if (end < 0) return;
-                const chunk = this.buf.slice(from, end);
-                this.buf = this.buf.slice(end + 2);
-                const ok = chunk[0] === '=';
-                const body = chunk.replace(/^[=?]\s*\d*\s?/, '').trim();
-                const w = this.queue.shift();
-                if (w) w.res({ ok, body });
-              }
-            }
-            send(cmd, timeoutMs = 600000) {
-              return new Promise((res, rej) => {
-                const t = setTimeout(() => rej(new Error(`GTP timeout on ${this.name}: ${cmd}`)), timeoutMs);
-                this.queue.push({
-                  res: v => { clearTimeout(t); res(v); },
-                  rej: e => { clearTimeout(t); rej(e); }
-                });
-                fs.appendFileSync('gtp.log', `${this.name} > ${cmd}\n`);
-                this.proc.stdin.write(cmd + '\n');
-              }).then(v => {
-                fs.appendFileSync('gtp.log', `${this.name} < ${v.ok ? '=' : '?'} ${v.body}\n`);
-                return v;
-              });
-            }
-            kill() { try { this.proc.kill(); } catch(e){} }
+          constructor(binPath, args, name) {
+          this.name = name;
+          this.buf = '';
+          this.queue = [];
+          this.proc = spawn(binPath, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+          this.proc.stdout.setEncoding('utf8');
+          this.proc.stdout.on('data', d => { this.buf += d.replace(/\r/g, ''); this.drain(); });
+          this.proc.stderr.setEncoding('utf8');
+          this.proc.stderr.on('data', d => fs.appendFileSync(`${name}.stderr.log`, d));
+          this.proc.on('exit', code => {
+          while (this.queue.length) this.queue.shift().rej(new Error(`${name} exited: ${code}`));
+          });
+          }
+          drain() {
+          for (;;) {
+          const m = this.buf.match(/(^|\n)[=?]/);
+          if (!m) { if (this.buf.length > 1 << 20) this.buf = this.buf.slice(-4096); return; }
+          const from = m.index + m[1].length;
+          const end = this.buf.indexOf('\n\n', from);
+          if (end < 0) return;
+          const chunk = this.buf.slice(from, end);
+          this.buf = this.buf.slice(end + 2);
+          const ok = chunk[0] === '=';
+          const body = chunk.replace(/^[=?]\s*\d*\s?/, '').trim();
+          const w = this.queue.shift();
+          if (w) w.res({ ok, body });
+          }
+          }
+          send(cmd, timeoutMs = 600000) {
+          return new Promise((res, rej) => {
+          const t = setTimeout(() => rej(new Error(`GTP timeout on ${this.name}: ${cmd}`)), timeoutMs);
+          this.queue.push({
+          res: v => { clearTimeout(t); res(v); },
+          rej: e => { clearTimeout(t); rej(e); }
+          });
+          fs.appendFileSync('gtp.log', `${this.name} > ${cmd}\n`);
+          this.proc.stdin.write(cmd + '\n');
+          }).then(v => {
+          fs.appendFileSync('gtp.log', `${this.name} < ${v.ok ? '=' : '?'} ${v.body}\n`);
+          return v;
+          });
+          }
+          kill() { try { this.proc.kill(); } catch(e){} }
           }
           
-          // あなたの作成した KOKUBYAKU_Native.exe のコンソール入出力をエミュレートするラッパー
           class KokubyakuInteractive {
-            constructor(binPath, budget, kokuColor) {
-              this.proc = spawn(binPath, [], { stdio: ['pipe', 'pipe', 'pipe'] });
-              this.buf = '';
-              this.budget = budget;
-              this.kokuColor = kokuColor;
-              this.humanColor = kokuColor === 1 ? 2 : 1;
-              this.resolveWait = null;
-              this.waitRegex = null;
-              
-              this.proc.stdout.on('data', d => {
-                this.buf += d.toString().replace(/\r/g, '');
-                fs.appendFileSync('koku.raw.log', d.toString());
-                this.checkWait();
-              });
-              this.proc.stderr.on('data', d => fs.appendFileSync('koku.err.log', d.toString()));
-            }
-            checkWait() {
-              if (this.resolveWait && this.waitRegex) {
-                const m = this.buf.match(this.waitRegex);
-                if (m) {
-                  const res = this.resolveWait;
-                  this.resolveWait = null;
-                  this.waitRegex = null;
-                  this.buf = this.buf.slice(m.index + m[0].length);
-                  res(m);
-                }
-              }
-            }
-            async waitFor(regex) {
-              return new Promise(res => {
-                this.waitRegex = regex;
-                this.resolveWait = res;
-                this.checkWait();
-              });
-            }
-            async init() {
-              await this.waitFor(/Play as Black\(1\) or White\(2\)\?/);
-              this.proc.stdin.write(this.humanColor + '\n');
-              await this.waitFor(/AI think time \(ms\)\?/);
-              this.proc.stdin.write(this.budget + '\n');
-            }
-            async sendHumanMove(moveStr) {
-              await this.waitFor(/Your move \(e\.g\. d3\):/);
-              this.proc.stdin.write(moveStr + '\n');
-            }
-            async waitAiMove() {
-              const m = await this.waitFor(/AI plays: ([a-hA-H][1-8])|>>> No moves\. Pass\./);
-              if (m[0].includes('Pass') || m[0].includes('pass')) return 'PASS';
-              return m[1].toUpperCase();
-            }
-            kill() { try { this.proc.kill(); } catch(e){} }
+          constructor(binPath, budget, kokuColor) {
+          this.proc = spawn(binPath, [], { stdio: ['pipe', 'pipe', 'pipe'] });
+          this.buf = '';
+          this.budget = budget;
+          this.kokuColor = kokuColor;
+          this.humanColor = kokuColor === 1 ? 2 : 1;
+          this.resolveWait = null;
+          this.waitRegex = null;
+          this.proc.stdout.on('data', d => {
+          this.buf += d.toString().replace(/\r/g, '');
+          fs.appendFileSync('koku.raw.log', d.toString());
+          this.checkWait();
+          });
+          this.proc.stderr.on('data', d => fs.appendFileSync('koku.err.log', d.toString()));
+          }
+          checkWait() {
+          if (this.resolveWait && this.waitRegex) {
+          const m = this.buf.match(this.waitRegex);
+          if (m) {
+          const res = this.resolveWait;
+          this.resolveWait = null;
+          this.waitRegex = null;
+          this.buf = this.buf.slice(m.index + m[0].length);
+          res(m);
+          }
+          }
+          }
+          async waitFor(regex) {
+          return new Promise(res => {
+          this.waitRegex = regex;
+          this.resolveWait = res;
+          this.checkWait();
+          });
+          }
+          async init() {
+          await this.waitFor(/Play as Black\(1\) or White\(2\)\?/);
+          this.proc.stdin.write(this.humanColor + '\n');
+          await this.waitFor(/AI think time \(ms\)\?/);
+          this.proc.stdin.write(this.budget + '\n');
+          }
+          async sendHumanMove(moveStr) {
+          await this.waitFor(/Your move \(e\.g\. d3\):/);
+          // ★ここで必ず小文字に変換して送ることでエラー落ちを防ぎます
+          this.proc.stdin.write(moveStr.toLowerCase() + '\n');
+          }
+          async waitAiMove() {
+          const m = await this.waitFor(/AI plays: ([a-hA-H][1-8])|>>> No moves\. Pass\./);
+          if (m[0].includes('Pass') || m[0].includes('pass')) return 'PASS';
+          return m[1].toUpperCase();
+          }
+          kill() { try { this.proc.kill(); } catch(e){} }
           }
           
           async function playGame(egaColor, gameNo) {
-            const egaPath = path.join(process.cwd(), 'ega', 'Egaroucid_for_Console.exe');
-            const kokuPath = path.join(process.cwd(), 'KOKUBYAKU_Native.exe');
-            
-            const ega = new Gtp(egaPath, ['-gtp'], 'Egaroucid');
-            await ega.send('name', 5000).catch(()=>{});
-            await ega.send(`time_settings 0 ${Math.max(1, Math.round(MOVE_MS / 1000))} 1`).catch(()=>{});
-            await ega.send(`level ${EGA_LEVEL}`).catch(()=>{});
-            await ega.send('clear_board');
-            
-            const kokuColor = egaColor === 1 ? 2 : 1;
-            const koku = new KokubyakuInteractive(kokuPath, MOVE_MS, kokuColor);
-            await koku.init();
-            
-            let turn = 1, passCount = 0;
-            const moves = [];
-            log(`\n=== Game ${gameNo}: Egaroucid = ${egaColor === 1 ? 'BLACK' : 'WHITE'} / Your KOKUBYAKU = ${kokuColor === 1 ? 'BLACK' : 'WHITE'} ===`);
-            
-            while (passCount < 2) {
-              const colorStr = turn === 1 ? 'B' : 'W';
-              
-              if (turn === egaColor) {
-                // Egaroucidの手番
-                const r = await ega.send(`genmove ${colorStr}`, MOVE_MS * 5 + 120000);
-                const move = r.body.split(/\s+/)[0].toUpperCase();
-                if (move === 'PASS' || move === 'pass') {
-                  passCount++;
-                  log(`  ${moves.length.toString().padStart(2)} Egaroucid   ${colorStr} PASS`);
-                  // KOKUBYAKU側も自動でパスを認識して表示を出力するため、それを待つ
-                  await koku.waitFor(/>>> No moves\. Pass\./);
-                } else {
-                  passCount = 0;
-                  moves.push(`${colorStr}:${move}`);
-                  log(`  ${moves.length.toString().padStart(2)} Egaroucid   ${colorStr} ${move}`);
-                  await koku.sendHumanMove(move);
-                }
-              } else {
-                // KOKUBYAKUの手番 (あなたのバイナリが出力するログを読む)
-                const move = await koku.waitAiMove();
-                if (move === 'PASS') {
-                  passCount++;
-                  log(`  ${moves.length.toString().padStart(2)} KOKUBYAKU   ${colorStr} PASS`);
-                  await ega.send(`play ${colorStr} PASS`);
-                } else {
-                  passCount = 0;
-                  moves.push(`${colorStr}:${move}`);
-                  log(`  ${moves.length.toString().padStart(2)} KOKUBYAKU   ${colorStr} ${move}`);
-                  await ega.send(`play ${colorStr} ${move}`);
-                }
-              }
-              turn = 3 - turn;
-            }
-            
-            // 終局時、KOKUBYAKUが計算した最終スコアを読み取る
-            const res = await koku.waitFor(/Black\(X\):\s*(\d+)\s+White\(O\):\s*(\d+)/);
-            const b = parseInt(res[1], 10);
-            const w = parseInt(res[2], 10);
-            
-            const egaScore = egaColor === 1 ? b : w;
-            const kokuScore = kokuColor === 1 ? b : w;
-            let result = 'Draw';
-            if (egaScore > kokuScore) result = 'Egaroucid Win';
-            else if (kokuScore > egaScore) result = 'KOKUBYAKU Win';
-            
-            log(`--- Game ${gameNo} End: Black ${b} - White ${w} / Egaroucid ${egaScore} - KOKUBYAKU ${kokuScore} => ${result}`);
-            
-            ega.kill();
-            koku.kill();
-            
-            return { gameNo, egaColor: egaColor === 1 ? 'black' : 'white', black: b, white: w, egaroucid: egaScore, kokubyaku: kokuScore, result, moves };
+          const egaPath = path.join(process.cwd(), 'ega', 'Egaroucid_for_Console.exe');
+          const kokuPath = path.join(process.cwd(), 'KOKUBYAKU_Native.exe');
+          const ega = new Gtp(egaPath, ['-gtp'], 'Egaroucid');
+          await ega.send('name', 5000).catch(()=>{});
+          await ega.send(`time_settings 0 ${Math.max(1, Math.round(MOVE_MS / 1000))} 1`).catch(()=>{});
+          await ega.send(`level ${EGA_LEVEL}`).catch(()=>{});
+          await ega.send('clear_board');
+          const kokuColor = egaColor === 1 ? 2 : 1;
+          const koku = new KokubyakuInteractive(kokuPath, MOVE_MS, kokuColor);
+          await koku.init();
+          let turn = 1, passCount = 0;
+          const moves = [];
+          log(`\n=== Game ${gameNo}: Egaroucid = ${egaColor === 1 ? 'BLACK' : 'WHITE'} / Your KOKUBYAKU = ${kokuColor === 1 ? 'BLACK' : 'WHITE'} ===`);
+          while (passCount < 2) {
+          const colorStr = turn === 1 ? 'B' : 'W';
+          if (turn === egaColor) {
+          // GitHub Actions環境のスペックを考慮し、タイムアウト上限を余裕を持って10分に設定
+          const r = await ega.send(`genmove ${colorStr}`, MOVE_MS * 10 + 600000);
+          const move = r.body.split(/\s+/)[0].toUpperCase();
+          if (move === 'PASS' || move === 'pass') {
+          passCount++;
+          log(`  ${moves.length.toString().padStart(2)} Egaroucid   ${colorStr} PASS`);
+          await koku.waitFor(/>>> No moves\. Pass\./);
+          } else {
+          passCount = 0;
+          moves.push(`${colorStr}:${move}`);
+          log(`  ${moves.length.toString().padStart(2)} Egaroucid   ${colorStr} ${move}`);
+          await koku.sendHumanMove(move);
+          }
+          } else {
+          const move = await koku.waitAiMove();
+          if (move === 'PASS') {
+          passCount++;
+          log(`  ${moves.length.toString().padStart(2)} KOKUBYAKU   ${colorStr} PASS`);
+          await ega.send(`play ${colorStr} PASS`);
+          } else {
+          passCount = 0;
+          moves.push(`${colorStr}:${move}`);
+          log(`  ${moves.length.toString().padStart(2)} KOKUBYAKU   ${colorStr} ${move}`);
+          await ega.send(`play ${colorStr} ${move}`);
+          }
+          }
+          turn = 3 - turn;
+          }
+          const res = await koku.waitFor(/Black\(X\):\s*(\d+)\s+White\(O\):\s*(\d+)/);
+          const b = parseInt(res[1], 10);
+          const w = parseInt(res[2], 10);
+          const egaScore = egaColor === 1 ? b : w;
+          const kokuScore = kokuColor === 1 ? b : w;
+          let result = 'Draw';
+          if (egaScore > kokuScore) result = 'Egaroucid Win';
+          else if (kokuScore > egaScore) result = 'KOKUBYAKU Win';
+          log(`--- Game ${gameNo} End: Black ${b} - White ${w} / Egaroucid ${egaScore} - KOKUBYAKU ${kokuScore} => ${result}`);
+          ega.kill();
+          koku.kill();
+          return { gameNo, egaColor: egaColor === 1 ? 'black' : 'white', black: b, white: w, egaroucid: egaScore, kokubyaku: kokuScore, result, moves };
           }
           
           (async () => {
-            fs.writeFileSync('match.log', '');
-            fs.writeFileSync('gtp.log', '');
-            fs.writeFileSync('koku.raw.log', '');
-            
-            const results = [];
-            try {
-              for (let i = 0; i < GAMES; i++) {
-                results.push(await playGame(i % 2 === 0 ? 1 : 2, i + 1));
-              }
-            } finally {
-              const tally = { games: results.length, egaroucid_wins: 0, koku_wins: 0, draws: 0 };
-              for (const r of results) {
-                if (r.result.includes('Egaroucid Win')) tally.egaroucid_wins++;
-                else if (r.result.includes('KOKUBYAKU Win')) tally.koku_wins++;
-                else tally.draws++;
-              }
-              fs.writeFileSync('result.json', JSON.stringify({ tally, results }, null, 2));
-              log('\n===== TOTAL =====');
-              log(`Egaroucid ${tally.egaroucid_wins} - ${tally.koku_wins} KOKUBYAKU (Draw ${tally.draws})`);
-              
-              if (process.env.GITHUB_STEP_SUMMARY) {
-                let md = '## Ultimate Native Match Result (Windows)\n\n';
-                md += `**Egaroucid ${tally.egaroucid_wins} - ${tally.koku_wins} KOKUBYAKU** (Draw ${tally.draws})\n\n`;
-                md += `* Time limit per move: ${MOVE_MS} ms\n`;
-                md += `* Egaroucid Level: ${EGA_LEVEL}\n\n`;
-                md += '| Game | Egaroucid | Black | White | Result |\n|:---:|:---:|:---:|:---:|:---|\n';
-                for (const r of results) md += `| ${r.gameNo} | ${r.egaColor} | ${r.black} | ${r.white} | **${r.result}** |\n`;
-                fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, md);
-              }
-            }
+          fs.writeFileSync('match.log', '');
+          fs.writeFileSync('gtp.log', '');
+          fs.writeFileSync('koku.raw.log', '');
+          const results = [];
+          try {
+          for (let i = 0; i < GAMES; i++) {
+          results.push(await playGame(i % 2 === 0 ? 1 : 2, i + 1));
+          }
+          } finally {
+          const tally = { games: results.length, egaroucid_wins: 0, koku_wins: 0, draws: 0 };
+          for (const r of results) {
+          if (r.result.includes('Egaroucid Win')) tally.egaroucid_wins++;
+          else if (r.result.includes('KOKUBYAKU Win')) tally.koku_wins++;
+          else tally.draws++;
+          }
+          fs.writeFileSync('result.json', JSON.stringify({ tally, results }, null, 2));
+          log('\n===== TOTAL =====');
+          log(`Egaroucid ${tally.egaroucid_wins} - ${tally.koku_wins} KOKUBYAKU (Draw ${tally.draws})`);
+          if (process.env.GITHUB_STEP_SUMMARY) {
+          let md = '## Ultimate Native Match Result (Windows)\n\n';
+          md += `**Egaroucid ${tally.egaroucid_wins} - ${tally.koku_wins} KOKUBYAKU** (Draw ${tally.draws})\n\n`;
+          md += `* Time limit per move: ${MOVE_MS} ms\n`;
+          md += `* Egaroucid Level: ${EGA_LEVEL}\n\n`;
+          md += '| Game | Egaroucid | Black | White | Result |\n|:---:|:---:|:---:|:---:|:---|\n';
+          for (const r of results) md += `| ${r.gameNo} | ${r.egaColor} | ${r.black} | ${r.white} | **${r.result}** |\n`;
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, md);
+          }
+          }
           })().catch(e => { log('[FATAL] ' + (e && e.stack || e)); process.exit(1); });
           EOF
 
