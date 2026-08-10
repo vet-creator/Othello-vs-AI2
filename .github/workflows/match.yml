@@ -39,9 +39,38 @@ jobs:
       - name: Download Egaroucid (Windows release)
         shell: bash
         run: |
-          VER="$(echo "$EGA_TAG" | sed 's/^console_v//; s/\./_/g')"
-          curl -sL -o ega.zip "https://github.com/Nyanyan/Egaroucid/releases/download/${EGA_TAG}/Egaroucid_for_Console_${VER}_Windows_AVX2.zip"
-          unzip -q ega.zip -d ega
+          # GitHub APIを使って、指定されたタグの中からWindows用のZIPを自動検索してダウンロードします
+          echo "Fetching release info for tag: ${EGA_TAG}"
+          API_URL="https://api.github.com/repos/Nyanyan/Egaroucid/releases/tags/${EGA_TAG}"
+          
+          # SIMD(AVX2)版を優先的に検索
+          DOWNLOAD_URL=$(curl -sL "$API_URL" | jq -r '.assets[].browser_download_url | select(type == "string")' | grep -i 'Windows' | grep -i 'SIMD' | head -n 1)
+          
+          # 見つからなかった場合はGeneric版などを探す
+          if [ -z "$DOWNLOAD_URL" ]; then
+            DOWNLOAD_URL=$(curl -sL "$API_URL" | jq -r '.assets[].browser_download_url | select(type == "string")' | grep -i 'Windows' | head -n 1)
+          fi
+          
+          if [ -z "$DOWNLOAD_URL" ]; then
+            echo "エラー: 指定されたタグ (${EGA_TAG}) のWindows用ZIPが見つかりません。"
+            exit 1
+          fi
+          
+          echo "Downloading from: $DOWNLOAD_URL"
+          curl -sL -o ega.zip "$DOWNLOAD_URL"
+          
+          # 解凍し、exeが存在するディレクトリを ega/ にリネームして構造を統一する
+          unzip -q ega.zip -d ega_temp
+          EGA_EXE=$(find ega_temp -name "Egaroucid_for_Console.exe" | head -n 1)
+          
+          if [ -z "$EGA_EXE" ]; then
+            echo "エラー: ZIP内に Egaroucid_for_Console.exe が見つかりませんでした。"
+            exit 1
+          fi
+          
+          EGA_DIR=$(dirname "$EGA_EXE")
+          mv "$EGA_DIR" ega
+          echo "Egaroucid extracted successfully to ega/ directory."
 
       - name: Verify KOKUBYAKU files
         shell: bash
