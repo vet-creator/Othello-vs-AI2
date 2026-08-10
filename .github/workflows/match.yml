@@ -99,6 +99,7 @@ jobs:
           this.buf = '';
           this.queue = [];
           this.proc = spawn(binPath, args, { cwd: cwd, stdio: ['pipe', 'pipe', 'pipe'] });
+          this.proc.stdin.on('error', e => { if (e.code !== 'EPIPE' && e.code !== 'EOF') console.error(`${name} stdin error:`, e); });
           this.proc.stdout.setEncoding('utf8');
           this.proc.stdout.on('data', d => {
           this.buf += d.replace(/\r/g, '');
@@ -133,7 +134,7 @@ jobs:
           rej: e => { clearTimeout(t); rej(e); }
           });
           fs.appendFileSync('gtp.log', `${this.name} > ${cmd}\n`);
-          this.proc.stdin.write(cmd + '\n');
+          try { this.proc.stdin.write(cmd + '\n'); } catch(e){}
           }).then(v => {
           fs.appendFileSync('gtp.log', `${this.name} < ${v.ok ? '=' : '?'} ${v.body}\n`);
           return v;
@@ -150,6 +151,8 @@ jobs:
           this.humanColor = kokuColor === 1 ? 2 : 1;
           this.resolveWait = null;
           this.waitRegex = null;
+          // KOKUBYAKU終了後のEPIPEによるNode.jsクラッシュを無効化
+          this.proc.stdin.on('error', e => { if (e.code !== 'EPIPE' && e.code !== 'EOF') console.error('KOKU stdin error:', e); });
           this.proc.stdout.on('data', d => {
           const str = d.toString().replace(/\r/g, '');
           fs.appendFileSync('koku.raw.log', str);
@@ -178,21 +181,22 @@ jobs:
           });
           }
           forceFlush() {
-          // ★Windowsの「4KB見えない壁」を壊すためのハック
-          // わざと「Illegal move」を120回起こさせてバッファを押し出します
+          if (this.proc.exitCode !== null) return;
           const dummies = Array(120).fill('flush\n').join('');
-          this.proc.stdin.write(dummies);
+          try { this.proc.stdin.write(dummies); } catch(e){}
           }
           init() {
+          try {
           this.proc.stdin.write(this.humanColor + '\n');
           this.proc.stdin.write(this.budget + '\n');
+          } catch(e){}
           if (this.humanColor === 2) {
-          // KOKUBYAKUが黒（先手）の場合、すぐ出力が出るようにバッファを押し出す
           this.forceFlush();
           }
           }
           sendHumanMove(moveStr) {
-          this.proc.stdin.write(moveStr.toLowerCase() + '\n');
+          if (this.proc.exitCode !== null) return;
+          try { this.proc.stdin.write(moveStr.toLowerCase() + '\n'); } catch(e){}
           this.forceFlush();
           }
           async waitAiMove() {
